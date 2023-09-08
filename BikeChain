@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.15;
+
+contract BikeChain {
+
+    address owner;
+    address payable companyWallet; // Company (B) wallet address
+
+    constructor() {
+        owner = msg.sender;
+        companyWallet = payable(0x3fD67d86757c1B5ee3677673ab131FbF9fAD621f); // Replace this with the actual company wallet address
+    }
+
+    // Add yourself as a Renter
+
+    struct Renter {
+        address payable walletAddress;
+        string firstName;
+        string lastName;
+        bool canRent;
+        bool active;
+        uint balance;
+        uint due;
+        uint startTime;
+        uint endTime;
+        uint penalty;
+        Rewards rewards;
+    }
+
+    struct Rewards {
+        uint rideCount; // Number of rides
+        uint rideDistance; // Total ride distance in kilometers
+        uint leaderboardRewards; // Rewards for leaderboard winners
+        bool[3] leaderboardPositions; // Keeps track of leaderboard positions for top 3 riders
+        bool violation;
+    }
+
+    mapping (address => Renter) public renters;
+    mapping (address => mapping(uint => uint)) public monthlyRideCount; // Monthly ride count for each user
+    uint256 public leaderboardReward = 5 ether; // Reward for leaderboard winners
+    uint256 public rewardPerRideCount = 0.1 ether; // Reward per 10 rides
+    uint256 public rewardPerDistance = 0.1 ether; // Reward per 10 kilometers
+    uint256 public penaltyPerViolation = 0.5 ether; // Penalty for rule violation
+   
+    // Create a new Rewards struct
+    function createRewards() private pure returns (Rewards memory) {
+        return Rewards(0, 0, 0, [false, false, false], false);
+    }
+
+    function addRenter(
+        address payable walletAddress,
+        string memory firstName, 
+        string memory lastName, 
+        bool canRent, 
+        bool active, 
+        uint balance, 
+        uint due, 
+        uint startTime, 
+        uint endTime
+        ) public {
+        renters[walletAddress] = Renter(
+            walletAddress, 
+            firstName, 
+            lastName, 
+            canRent, 
+            active, 
+            balance, 
+            due, 
+            startTime, 
+            endTime, 
+            0, 
+            createRewards() // Use the createRewards function to initialize the Rewards struct
+            );
+    }
+
+    // Start rent a bike
+    function startRental(address walletAddress) public {
+        require(renters[walletAddress].due == 0, "You have a pending balance.");
+        require(renters[walletAddress].canRent == true, "You cannot rent at this time.");
+        renters[walletAddress].active = true;
+        renters[walletAddress].startTime = block.timestamp;
+        renters[walletAddress].canRent = false;
+    }
+
+    // Stop rent a bike
+    function stopRental(address walletAddress, uint256 distance, bool violation) public {
+        require(renters[walletAddress].active == true, "Please start rent a bike first.");
+        renters[walletAddress].active = false;
+        renters[walletAddress].endTime = block.timestamp;
+        setDue(walletAddress);
+        updateRewards(walletAddress, distance, violation); // Call updateRewards function when return bike
+        updateMonthlyRideCount(walletAddress); // Update monthly ride count
+        updateLeaderboard(walletAddress); // Update leaderboard positions
+        updatePenaltyViolation(walletAddress, violation); // Update penalty violation
+    }
+
+    // Get total duration of bike use
+    function renterTimespan(uint startTime, uint endTime) internal pure returns(uint) {
+        return endTime - startTime;
+    }
+
+    function getTotalDuration(address walletAddress) public view returns(uint) {
+        require(renters[walletAddress].active == false, "Bike is currently rented.");
+        uint timespan = renterTimespan(renters[walletAddress].startTime, renters[walletAddress].endTime);
+        uint timespanInMinutes = timespan / 60;
+        return timespanInMinutes;
+    }
+
+    // Get Contract balance
+    function balanceOf() view public returns(uint) {
+        return address(this).balance;
+    }
+
+    // Get Renter's balance
+    function balanceOfRenter(address walletAddress) public view returns(uint) {
+        return renters[walletAddress].balance;
+    }
+
+    // Get the balance of the company's wallet
+    function balanceOfCompany(address companyAddress) public view returns (uint) {
+        return companyAddress.balance;
+    }
+
+    // Set Due amount
+    function setDue(address walletAddress) internal {
+        uint timespanMinutes = getTotalDuration(walletAddress);
+        uint fiveMinuteIncrements = timespanMinutes / 5;
+        renters[walletAddress].due = fiveMinuteIncrements * 0.01 ether;
+        //renters[walletAddress].due = timespanMinutes * 0.01 ether;
+    }
+
+    function canRentBike(address walletAddress) public view returns(bool) {
+        return renters[walletAddress].canRent;
+    }
+
+    // Deposit
+    function deposit(address walletAddress) payable public {
+        renters[walletAddress].balance += msg.value;
+    }
+
+    // Make Payment
+    function makePayment(address walletAddress) payable public {
+        require(renters[walletAddress].due > 0, "You do not have anything due at this time.");
+        require(renters[walletAddress].balance > msg.value, "You do not have enough funds to cover payment. Please make a deposit.");
+        
+        // Transfer the due amount to the company wallet
+        companyWallet.transfer(renters[walletAddress].due);    
+        
+        renters[walletAddress].balance -= renters[walletAddress].due;
+        renters[walletAddress].canRent = true;
+        renters[walletAddress].due = 0;
+        renters[walletAddress].startTime = 0;
+        renters[walletAddress].endTime = 0;
+    }
+
+    // Update rewards
+    function updateRewards(address walletAddress, uint256 distance, bool violation) internal {
+        renters[walletAddress].rewards.rideCount++;
+        renters[walletAddress].rewards.rideDistance += distance;
+        uint256 rideCountRewards = (renters[walletAddress].rewards.rideCount / 10) * rewardPerRideCount;
+        uint256 distanceRewards = (renters[walletAddress].rewards.rideDistance / 10) * rewardPerDistance;
+        uint256 penalty = violation ? penaltyPerViolation : 0;
+        renters[walletAddress].balance += rideCountRewards + distanceRewards - penalty;
+    }
+
+    // Update monthly ride count
+    function updateMonthlyRideCount(address walletAddress) internal {
+        uint256 currentMonth = (block.timestamp / 1 days) / 30; // Assuming 30 days per month
+        monthlyRideCount[walletAddress][currentMonth]++;
+    }
+
+    // Update leaderboard positions
+    function updateLeaderboard(address walletAddress) internal {
+        bool[3] memory positions = renters[walletAddress].rewards.leaderboardPositions;
+        uint256 currentMonth = (block.timestamp / 1 days) / 30; // Assuming 30 days per month
+
+        // Check if the user has entered top 3 positions
+        for (uint256 i = 0; i < 3; i++) {
+            if (!positions[i]) {
+                if (i == 0 || (i > 0 && monthlyRideCount[walletAddress][currentMonth] > monthlyRideCount[renters[walletAddress].walletAddress][currentMonth])) {
+                    for (uint256 j = 2; j > i; j--) {
+                        renters[renters[walletAddress].walletAddress].rewards.leaderboardPositions[j] = renters[renters[walletAddress].walletAddress].rewards.leaderboardPositions[j - 1];
+                    }
+                    renters[renters[walletAddress].walletAddress].rewards.leaderboardPositions[i] = true;
+                    break;
+                }
+            }
+        }
+
+        // Check if the user has won a leaderboard reward
+        if (positions[0] && renters[walletAddress].rewards.leaderboardRewards < leaderboardReward) {
+            renters[walletAddress].rewards.leaderboardRewards = leaderboardReward;
+            renters[walletAddress].balance += leaderboardReward;
+        }
+    }
+
+    // Update penalty violation
+    function updatePenaltyViolation(address walletAddress, bool violation) internal {
+    if (violation) {
+        renters[walletAddress].penalty += penaltyPerViolation;
+        renters[walletAddress].balance -= penaltyPerViolation;
+        }   
+    }
+
+    // Get rewards balance
+    function rewardsOf(address walletAddress) public view returns(uint) {
+        Renter memory renter = renters[walletAddress];
+        uint256 rideCountRewards = (renter.rewards.rideCount / 10) * rewardPerRideCount;
+        uint256 distanceRewards = (renter.rewards.rideDistance / 10) * rewardPerDistance;
+        return rideCountRewards + distanceRewards + renter.rewards.leaderboardRewards - penaltyPerViolation;
+    }
+
+    // Redeem rewards
+    function redeemRewards(address walletAddress) public {
+        uint rewards = rewardsOf(walletAddress);
+        require(rewards > 0, "No rewards available");
+        renters[walletAddress].balance = 0;
+        payable(walletAddress).transfer(rewards);
+        renters[walletAddress].canRent = true;
+    }
+
+    // Update reward per ride count
+    // function updateRewardPerRideCount(uint256 _reward) public {
+    //    require(msg.sender == owner, "Only owner can update reward per ride count.");
+    //    rewardPerRideCount = _reward;
+    // }
+
+    // Update reward per distance
+    // function updateRewardPerDistance(uint256 _reward) public {
+    //    require(msg.sender == owner, "Only owner can update reward per distance.");
+    //    rewardPerDistance = _reward;
+    // }
+
+    // Update leaderboard reward
+    // function updateLeaderboardReward(uint256 _reward) public {
+    //    require(msg.sender == owner, "Only owner can update leaderboard reward.");
+    //    leaderboardReward = _reward;
+    // }
+
+    // Update penalty 
+    // function updatePenaltyPerViolation(uint256 penalty) public {
+    //     require(msg.sender == owner, "Only owner can update penalty.");
+    //     penaltyPerViolation = _penalty;
+    // }
+
+    // Get current leaderboard positions
+    function getLeaderboardPositions() public view returns(bool[3] memory) {
+        return renters[msg.sender].rewards.leaderboardPositions;
+    }
+}
